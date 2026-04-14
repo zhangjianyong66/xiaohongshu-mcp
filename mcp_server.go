@@ -6,12 +6,20 @@ import (
 	"fmt"
 	"runtime/debug"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/sirupsen/logrus"
 )
 
 // Helper functions for annotation pointers
 func boolPtr(b bool) *bool { return &b }
+
+func emptyObjectInputSchema() *jsonschema.Schema {
+	return &jsonschema.Schema{
+		Type:       "object",
+		Properties: map[string]*jsonschema.Schema{},
+	}
+}
 
 // MCP 工具参数结构体定义
 
@@ -158,6 +166,7 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 		&mcp.Tool{
 			Name:        "check_login_status",
 			Description: "检查小红书登录状态",
+			InputSchema: emptyObjectInputSchema(),
 			Annotations: &mcp.ToolAnnotations{
 				Title:        "Check Login Status",
 				ReadOnlyHint: true,
@@ -174,6 +183,7 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 		&mcp.Tool{
 			Name:        "get_login_qrcode",
 			Description: "获取登录二维码（返回 Base64 图片和超时时间）",
+			InputSchema: emptyObjectInputSchema(),
 			Annotations: &mcp.ToolAnnotations{
 				Title:        "Get Login QR Code",
 				ReadOnlyHint: true,
@@ -190,6 +200,7 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 		&mcp.Tool{
 			Name:        "delete_cookies",
 			Description: "删除 cookies 文件，重置登录状态。删除后需要重新登录。",
+			InputSchema: emptyObjectInputSchema(),
 			Annotations: &mcp.ToolAnnotations{
 				Title:           "Delete Cookies",
 				DestructiveHint: boolPtr(true),
@@ -233,6 +244,7 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 		&mcp.Tool{
 			Name:        "list_feeds",
 			Description: "获取首页 Feeds 列表",
+			InputSchema: emptyObjectInputSchema(),
 			Annotations: &mcp.ToolAnnotations{
 				Title:        "List Feeds",
 				ReadOnlyHint: true,

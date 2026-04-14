@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -71,7 +72,7 @@ func convertToInternalFilters(filter FilterOption) ([]internalFilterOption, erro
 	var internalFilters []internalFilterOption
 
 	// 处理排序依据
-	if filter.SortBy != "" {
+	if !isDefaultFilterValue(filter.SortBy, "综合") {
 		internal, err := findInternalOption(1, filter.SortBy)
 		if err != nil {
 			return nil, fmt.Errorf("排序依据错误: %w", err)
@@ -80,7 +81,7 @@ func convertToInternalFilters(filter FilterOption) ([]internalFilterOption, erro
 	}
 
 	// 处理笔记类型
-	if filter.NoteType != "" {
+	if !isDefaultFilterValue(filter.NoteType, "不限") {
 		internal, err := findInternalOption(2, filter.NoteType)
 		if err != nil {
 			return nil, fmt.Errorf("笔记类型错误: %w", err)
@@ -89,7 +90,7 @@ func convertToInternalFilters(filter FilterOption) ([]internalFilterOption, erro
 	}
 
 	// 处理发布时间
-	if filter.PublishTime != "" {
+	if !isDefaultFilterValue(filter.PublishTime, "不限") {
 		internal, err := findInternalOption(3, filter.PublishTime)
 		if err != nil {
 			return nil, fmt.Errorf("发布时间错误: %w", err)
@@ -98,7 +99,7 @@ func convertToInternalFilters(filter FilterOption) ([]internalFilterOption, erro
 	}
 
 	// 处理搜索范围
-	if filter.SearchScope != "" {
+	if !isDefaultFilterValue(filter.SearchScope, "不限") {
 		internal, err := findInternalOption(4, filter.SearchScope)
 		if err != nil {
 			return nil, fmt.Errorf("搜索范围错误: %w", err)
@@ -107,7 +108,7 @@ func convertToInternalFilters(filter FilterOption) ([]internalFilterOption, erro
 	}
 
 	// 处理位置距离
-	if filter.Location != "" {
+	if !isDefaultFilterValue(filter.Location, "不限") {
 		internal, err := findInternalOption(5, filter.Location)
 		if err != nil {
 			return nil, fmt.Errorf("位置距离错误: %w", err)
@@ -116,6 +117,11 @@ func convertToInternalFilters(filter FilterOption) ([]internalFilterOption, erro
 	}
 
 	return internalFilters, nil
+}
+
+func isDefaultFilterValue(value, defaultValue string) bool {
+	normalized := strings.TrimSpace(value)
+	return normalized == "" || normalized == defaultValue
 }
 
 // findInternalOption 根据筛选组索引和文本查找内部筛选选项
@@ -174,18 +180,18 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 
 	page.MustWait(`() => window.__INITIAL_STATE__ !== undefined`)
 
-	// 如果有筛选条件，则应用筛选
-	if len(filters) > 0 {
-		// 将所有 FilterOption 转换为内部筛选选项
-		var allInternalFilters []internalFilterOption
-		for _, filter := range filters {
-			internalFilters, err := convertToInternalFilters(filter)
-			if err != nil {
-				return nil, fmt.Errorf("筛选选项转换失败: %w", err)
-			}
-			allInternalFilters = append(allInternalFilters, internalFilters...)
+	// 将所有 FilterOption 转换为内部筛选选项。默认值不触发页面筛选点击。
+	var allInternalFilters []internalFilterOption
+	for _, filter := range filters {
+		internalFilters, err := convertToInternalFilters(filter)
+		if err != nil {
+			return nil, fmt.Errorf("筛选选项转换失败: %w", err)
 		}
+		allInternalFilters = append(allInternalFilters, internalFilters...)
+	}
 
+	// 如果有非默认筛选条件，则应用筛选
+	if len(allInternalFilters) > 0 {
 		// 验证所有内部筛选选项
 		for _, filter := range allInternalFilters {
 			if err := validateInternalFilterOption(filter); err != nil {
@@ -193,25 +199,9 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 			}
 		}
 
-		// 悬停在筛选按钮上
-		filterButton := page.MustElement(`div.filter`)
-		filterButton.MustHover()
-
-		// 等待筛选面板出现
-		page.MustWait(`() => document.querySelector('div.filter-panel') !== null`)
-
-		// 应用所有筛选条件
-		for _, filter := range allInternalFilters {
-			selector := fmt.Sprintf(`div.filter-panel div.filters:nth-child(%d) div.tags:nth-child(%d)`,
-				filter.FiltersIndex, filter.TagsIndex)
-			option := page.MustElement(selector)
-			option.MustClick()
+		if err := applySearchFilters(page, allInternalFilters); err != nil {
+			return nil, err
 		}
-
-		// 等待页面更新
-		page.MustWaitStable()
-		// 重新等待 __INITIAL_STATE__ 更新
-		page.MustWait(`() => window.__INITIAL_STATE__ !== undefined`)
 	}
 
 	result := page.MustEval(`() => {
@@ -237,6 +227,42 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 	}
 
 	return feeds, nil
+}
+
+func applySearchFilters(page *rod.Page, filters []internalFilterOption) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("应用搜索筛选失败: %v", r)
+		}
+	}()
+
+	filterPage := page.Timeout(15 * time.Second)
+	defer filterPage.CancelTimeout()
+
+	// 悬停在筛选按钮上
+	filterButton := filterPage.MustElement(`div.filter`)
+	filterButton.MustHover()
+
+	// 等待筛选面板出现
+	filterPage.MustWait(`() => document.querySelector('div.filter-panel') !== null`)
+
+	// 应用所有筛选条件
+	for _, filter := range filters {
+		selector := fmt.Sprintf(`div.filter-panel div.filters:nth-child(%d) div.tags:nth-child(%d)`,
+			filter.FiltersIndex, filter.TagsIndex)
+		option := filterPage.MustElement(selector)
+		if option == nil {
+			return fmt.Errorf("筛选选项不存在: text=%s selector=%s", filter.Text, selector)
+		}
+		option.MustClick()
+	}
+
+	// 等待页面更新
+	filterPage.MustWaitStable()
+	// 重新等待 __INITIAL_STATE__ 更新
+	filterPage.MustWait(`() => window.__INITIAL_STATE__ !== undefined`)
+
+	return nil
 }
 
 func makeSearchURL(keyword string) string {
