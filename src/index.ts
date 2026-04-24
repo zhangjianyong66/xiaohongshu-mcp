@@ -4,12 +4,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { loadConfig } from "./config.js";
 import { RuntimeGuard } from "./guard.js";
-import { SessionStore } from "./session-store.js";
 import { AppError, type SearchFilters, type ToolCode, type ToolResponse } from "./types.js";
 import { XhsClient } from "./xhs-client.js";
 
 const config = loadConfig();
-const store = new SessionStore(config.sessionFile, config.sessionEncryptionKey);
 const guard = new RuntimeGuard(
   {
     search_feeds: config.searchMinIntervalMs,
@@ -17,7 +15,7 @@ const guard = new RuntimeGuard(
   },
   config.cooldownMs
 );
-const xhs = new XhsClient(config, store);
+const xhs = new XhsClient(config);
 
 const server = new McpServer({
   name: "xiaohongshu-mcp-ts-lite",

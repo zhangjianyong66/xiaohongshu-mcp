@@ -1,14 +1,7 @@
-import {
-  chromium,
-  type Browser,
-  type BrowserContext,
-  type BrowserContextOptions,
-  type LaunchOptions,
-  type Page
-} from "playwright";
 import fs from "node:fs/promises";
 import type { RuntimeConfig } from "./config.js";
-import { SessionStore } from "./session-store.js";
+import { CdpMcpClient } from "./cdp-mcp-client.js";
+import { McpCdpBrowserDriver } from "./browser-driver.js";
 import { AppError, type FeedItem, type SearchFilters } from "./types.js";
 
 const RISK_PATTERNS = [
@@ -50,22 +43,8 @@ const LOGIN_POLL_INTERVAL_MS = 1000;
 
 type LoginSessionStatus = "pending" | "success";
 
-type RuntimeSession = {
-  mode: "cdp" | "launch";
-  browser: Browser;
-  context: BrowserContext;
-  sharedPage: Page | null;
-};
-
-type AcquiredPage = {
-  page: Page;
-  release: () => Promise<void>;
-};
-
 type LoginSession = {
   status: LoginSessionStatus;
-  context: BrowserContext;
-  page: Page;
   qrCodeSrc: string;
   expiresAt: number;
   cleanupTimer: NodeJS.Timeout | null;
@@ -74,20 +53,27 @@ type LoginSession = {
 
 type LoginState = "logged_in" | "logged_out" | "unknown";
 
+type LoginStateProbe = {
+  hasLoginQr: boolean;
+  hasUserMarker: boolean;
+  cookieText: string;
+};
+
 export class XhsClient {
-  private runtimeSession: RuntimeSession | null = null;
+  private readonly cdpClient: CdpMcpClient;
+  private readonly driver: McpCdpBrowserDriver;
   private loginSession: LoginSession | null = null;
 
-  public constructor(
-    private readonly config: RuntimeConfig,
-    private readonly sessions: SessionStore
-  ) {}
+  public constructor(private readonly config: RuntimeConfig) {
+    this.cdpClient = new CdpMcpClient(config);
+    this.driver = new McpCdpBrowserDriver(this.cdpClient, config);
+  }
 
   public async checkLoginStatus(): Promise<{ is_logged_in: boolean; username?: string }> {
     const activeLoginSession = await this.getActiveLoginSession();
     if (activeLoginSession) {
       if (activeLoginSession.status === "success") {
-        const username = await this.readUsername(activeLoginSession.page);
+        const username = await this.readUsername();
         if (username) {
           return { is_logged_in: true, username };
         }
@@ -96,14 +82,14 @@ export class XhsClient {
       return { is_logged_in: false };
     }
 
-    return this.withPage(async (page) => {
-      await this.openExplore(page);
-      const loggedIn = await this.isLoggedIn(page);
+    return this.withRuntime(async () => {
+      await this.openExplore();
+      const loggedIn = await this.isLoggedIn();
       if (!loggedIn) {
         return { is_logged_in: false };
       }
 
-      const username = await this.readUsername(page);
+      const username = await this.readUsername();
       if (username) {
         return {
           is_logged_in: true,
@@ -146,23 +132,21 @@ export class XhsClient {
       };
     }
 
-    const runtime = await this.getOrCreateRuntimeSession();
-    const page = await runtime.context.newPage();
-    page.setDefaultTimeout(this.config.navTimeoutMs);
-
-    try {
-      await this.openExplore(page);
-      if (await this.isLoggedIn(page)) {
-        await this.saveSessionState(runtime.context);
-        await page.close().catch(() => undefined);
+    return this.withRuntime(async () => {
+      await this.openExplore();
+      if (await this.isLoggedIn()) {
         return { is_logged_in: true };
       }
 
-      await page.waitForSelector(".login-container .qrcode-img", {
-        timeout: this.config.navTimeoutMs
-      });
+      const src = await this.driver.waitFor<string | null>(
+        `
+          const img = document.querySelector('.login-container .qrcode-img, .login-mask .qrcode-img');
+          return img?.getAttribute('src') ?? null;
+        `,
+        (value) => typeof value === "string" && value.length > 0,
+        this.config.navTimeoutMs
+      );
 
-      const src = await page.getAttribute(".login-container .qrcode-img", "src");
       if (!src) {
         throw new AppError("internal_error", "failed to read qrcode src");
       }
@@ -173,8 +157,6 @@ export class XhsClient {
 
       const session: LoginSession = {
         status: "pending",
-        context: runtime.context,
-        page,
         qrCodeSrc: src,
         expiresAt: Date.now() + LOGIN_PENDING_TIMEOUT_MS,
         cleanupTimer: null,
@@ -194,44 +176,30 @@ export class XhsClient {
           reused: false
         }
       };
-    } catch (error) {
-      await page.close().catch(() => undefined);
-      if (error instanceof AppError) {
-        throw error;
-      }
-      throw new AppError("internal_error", error instanceof Error ? error.message : String(error));
-    }
+    });
   }
 
   public async searchFeeds(keyword: string, filters?: SearchFilters): Promise<SearchResult> {
-    return this.withPage(async (page) => {
-      await this.ensureLoggedInForRead(page);
+    return this.withRuntime(async () => {
+      await this.ensureLoggedInForRead();
 
       const encoded = encodeURIComponent(keyword);
       const url = `https://www.xiaohongshu.com/search_result?keyword=${encoded}&source=web_explore_feed`;
 
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: this.config.navTimeoutMs });
-      await page.waitForFunction(() => Boolean((window as unknown as { __INITIAL_STATE__?: unknown }).__INITIAL_STATE__), {
-        timeout: this.config.navTimeoutMs
-      });
+      await this.driver.navigate(url);
+      await this.driver.waitFor<boolean>(
+        `return Boolean(globalThis.__INITIAL_STATE__);`,
+        (ready) => ready === true,
+        this.config.navTimeoutMs
+      );
 
-      await this.detectRisk(page);
+      await this.detectRisk();
 
-      const feeds = await page.evaluate(() => {
-        const state = (window as unknown as {
-          __INITIAL_STATE__?: {
-            search?: {
-              feeds?: {
-                value?: unknown;
-                _value?: unknown;
-              };
-            };
-          };
-        }).__INITIAL_STATE__;
-
+      const feeds = await this.driver.evaluate<unknown[]>(`
+        const state = globalThis.__INITIAL_STATE__;
         const raw = state?.search?.feeds?.value ?? state?.search?.feeds?._value;
         return Array.isArray(raw) ? raw : [];
-      });
+      `);
 
       const response: SearchResult = {
         feeds: feeds as FeedItem[],
@@ -253,28 +221,23 @@ export class XhsClient {
       );
     }
 
-    return this.withPage(async (page) => {
-      await this.ensureLoggedInForRead(page);
+    return this.withRuntime(async () => {
+      await this.ensureLoggedInForRead();
 
       const url = `https://www.xiaohongshu.com/explore/${encodeURIComponent(feedId)}?xsec_token=${encodeURIComponent(xsecToken)}&xsec_source=pc_feed`;
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: this.config.navTimeoutMs });
-      await page.waitForFunction(() => Boolean((window as unknown as { __INITIAL_STATE__?: unknown }).__INITIAL_STATE__), {
-        timeout: this.config.navTimeoutMs
-      });
+      await this.driver.navigate(url);
+      await this.driver.waitFor<boolean>(
+        `return Boolean(globalThis.__INITIAL_STATE__);`,
+        (ready) => ready === true,
+        this.config.navTimeoutMs
+      );
 
-      await this.detectRisk(page);
+      await this.detectRisk();
 
-      const noteDetail = await page.evaluate((id) => {
-        const state = (window as unknown as {
-          __INITIAL_STATE__?: {
-            note?: {
-              noteDetailMap?: Record<string, unknown>;
-            };
-          };
-        }).__INITIAL_STATE__;
-
-        return state?.note?.noteDetailMap?.[id] ?? null;
-      }, feedId);
+      const noteDetail = await this.driver.evaluate<unknown>(`
+        const state = globalThis.__INITIAL_STATE__;
+        return state?.note?.noteDetailMap?.[${JSON.stringify(feedId)}] ?? null;
+      `);
 
       if (!noteDetail) {
         throw new AppError("internal_error", "note detail not found in initial state");
@@ -288,14 +251,11 @@ export class XhsClient {
     });
   }
 
-  private async withPage<T>(runner: (page: Page) => Promise<T>): Promise<T> {
-    const runtime = await this.getOrCreateRuntimeSession();
-    const { page, release } = await this.acquirePage(runtime);
-
+  private async withRuntime<T>(runner: () => Promise<T>): Promise<T> {
     try {
-      const result = await runner(page);
-      await this.saveSessionState(runtime.context);
-      return result;
+      await this.driver.ensureReady();
+      await this.driver.ensureTab();
+      return await runner();
     } catch (error) {
       if (error instanceof AppError) {
         throw error;
@@ -306,175 +266,21 @@ export class XhsClient {
         throw new AppError("timeout", message);
       }
       throw new AppError("internal_error", message);
-    } finally {
-      await release();
     }
   }
 
-  private async getOrCreateRuntimeSession(): Promise<RuntimeSession> {
-    const current = this.runtimeSession;
-    if (current && this.isRuntimeSessionAlive(current)) {
-      return current;
-    }
-
-    if (current) {
-      await this.disposeRuntimeSession(current);
-    }
-
-    if (this.config.browserMode === "cdp") {
-      let browser: Browser;
-      try {
-        browser = await chromium.connectOverCDP(this.config.cdpEndpoint);
-      } catch (error) {
-        throw new AppError(
-          "internal_error",
-          `failed to connect CDP endpoint: ${this.config.cdpEndpoint}. ensure system Chrome CDP is running`,
-          {
-            browser_mode: this.config.browserMode,
-            cdp_endpoint: this.config.cdpEndpoint,
-            cdp_profile: this.config.cdpProfile,
-            cause: error instanceof Error ? error.message : String(error)
-          }
-        );
-      }
-      const context = (await this.selectBestCdpContext(browser)) ?? (await browser.newContext({
-        userAgent: this.config.userAgent,
-        locale: "zh-CN",
-        viewport: { width: 1440, height: 900 }
-      }));
-      const session: RuntimeSession = {
-        mode: "cdp",
-        browser,
-        context,
-        sharedPage: null
-      };
-      this.runtimeSession = session;
-      return session;
-    }
-
-    const launchOptions: LaunchOptions = {
-      headless: this.config.headless
-    };
-    if (this.config.chromeExecutablePath) {
-      launchOptions.executablePath = this.config.chromeExecutablePath;
-    }
-    const browser = await chromium.launch(launchOptions);
-
-    const contextOptions: BrowserContextOptions = {
-      userAgent: this.config.userAgent,
-      locale: "zh-CN",
-      viewport: { width: 1440, height: 900 }
-    };
-    const state = await this.sessions.load();
-    if (state !== undefined) {
-      contextOptions.storageState = state;
-    }
-    const context = await browser.newContext(contextOptions);
-
-    const session: RuntimeSession = {
-      mode: "launch",
-      browser,
-      context,
-      sharedPage: null
-    };
-    this.runtimeSession = session;
-    return session;
+  private async openExplore(): Promise<void> {
+    await this.driver.navigate("https://www.xiaohongshu.com/explore");
   }
 
-  private isRuntimeSessionAlive(session: RuntimeSession): boolean {
-    if (this.runtimeSession !== session) {
-      return false;
-    }
-    if (!session.browser.isConnected()) {
-      return false;
-    }
-    return true;
-  }
-
-  private async disposeRuntimeSession(session: RuntimeSession): Promise<void> {
-    if (this.runtimeSession === session) {
-      this.runtimeSession = null;
-    }
-
-    if (session.mode === "launch") {
-      await session.context.close().catch(() => undefined);
-      await session.browser.close().catch(() => undefined);
-      return;
-    }
-
-    session.sharedPage = null;
-    await session.browser.close().catch(() => undefined);
-  }
-
-  private async acquirePage(session: RuntimeSession): Promise<AcquiredPage> {
-    if (this.config.reusePage) {
-      if (session.sharedPage && !session.sharedPage.isClosed()) {
-        session.sharedPage.setDefaultTimeout(this.config.navTimeoutMs);
-        return {
-          page: session.sharedPage,
-          release: async () => undefined
-        };
-      }
-
-      const existing = session.context.pages().find((p) => {
-        if (p.isClosed()) {
-          return false;
-        }
-        const url = p.url();
-        return url.includes("xiaohongshu.com");
-      }) ?? session.context.pages().find((p) => !p.isClosed());
-      if (existing) {
-        existing.setDefaultTimeout(this.config.navTimeoutMs);
-        session.sharedPage = existing;
-        return {
-          page: existing,
-          release: async () => undefined
-        };
-      }
-
-      const created = await session.context.newPage();
-      created.setDefaultTimeout(this.config.navTimeoutMs);
-      session.sharedPage = created;
-      return {
-        page: created,
-        release: async () => undefined
-      };
-    }
-
-    const page = await session.context.newPage();
-    page.setDefaultTimeout(this.config.navTimeoutMs);
-    return {
-      page,
-      release: async () => {
-        await page.close().catch(() => undefined);
-      }
-    };
-  }
-
-  private async saveSessionState(context: BrowserContext): Promise<void> {
-    try {
-      const nextState = await context.storageState();
-      await this.sessions.save(nextState);
-    } catch (error) {
-      process.stderr.write(`[xhs] save session state failed: ${error instanceof Error ? error.message : String(error)}\n`);
-    }
-  }
-
-  private async openExplore(page: Page): Promise<void> {
-    await page.goto("https://www.xiaohongshu.com/explore", {
-      waitUntil: "domcontentloaded",
-      timeout: this.config.navTimeoutMs
-    });
-  }
-
-  private async ensureLoggedInForRead(page: Page): Promise<void> {
+  private async ensureLoggedInForRead(): Promise<void> {
     const activeLoginSession = await this.getActiveLoginSession();
     if (activeLoginSession?.status === "success") {
       return;
     }
 
-    await this.openExplore(page);
-    const state = await this.detectLoginState(page);
+    await this.openExplore();
+    const state = await this.detectLoginState();
     if (state !== "logged_out") {
       return;
     }
@@ -484,74 +290,50 @@ export class XhsClient {
     });
   }
 
-  private async isLoggedIn(page: Page): Promise<boolean> {
-    const state = await this.detectLoginState(page);
+  private async isLoggedIn(): Promise<boolean> {
+    const state = await this.detectLoginState();
     return state === "logged_in" || state === "unknown";
   }
 
-  private async detectLoginState(page: Page): Promise<LoginState> {
-    const hasLoginQr = await page
-      .$(".login-container .qrcode-img, .login-mask .qrcode-img")
-      .then((el) => Boolean(el));
+  private async detectLoginState(): Promise<LoginState> {
+    const probe = await this.driver.evaluate<LoginStateProbe>(`
+      const cookieText = document.cookie || '';
+      const hasLoginQr = Boolean(document.querySelector('.login-container .qrcode-img, .login-mask .qrcode-img'));
+      const hasUserMarker = Boolean(document.querySelector('.main-container .user .link-wrapper .channel, a[href*="/user/profile/"], .reds-avatar'));
+      return { hasLoginQr, hasUserMarker, cookieText };
+    `);
 
-    const hasUserMarker = await page
-      .$(".main-container .user .link-wrapper .channel, a[href*=\"/user/profile/\"], .reds-avatar")
-      .then((el) => Boolean(el));
-    if (hasUserMarker) {
+    if (probe.hasUserMarker) {
       return "logged_in";
     }
 
-    const hasAuthCookie = await this.hasAuthCookie(page);
-    if (hasAuthCookie) {
+    if (this.hasAuthCookie(probe.cookieText)) {
       return "logged_in";
     }
 
-    if (hasLoginQr) {
+    if (probe.hasLoginQr) {
       return "logged_out";
     }
 
     return "unknown";
   }
 
-  private async hasAuthCookie(page: Page): Promise<boolean> {
-    const cookies = await page.context().cookies("https://www.xiaohongshu.com");
-    const authCookieNames = this.getAuthCookieNames();
-    return cookies.some((cookie) => {
-      if (!cookie.value) {
-        return false;
-      }
-      return authCookieNames.has(cookie.name);
-    });
-  }
-
-  private async selectBestCdpContext(browser: Browser): Promise<BrowserContext | undefined> {
-    const contexts = browser.contexts();
-    if (contexts.length === 0) {
-      return undefined;
-    }
-
-    const authCookieNames = this.getAuthCookieNames();
-    for (const context of contexts) {
-      try {
-        const cookies = await context.cookies("https://www.xiaohongshu.com");
-        const hasAuth = cookies.some((cookie) => cookie.value && authCookieNames.has(cookie.name));
-        if (hasAuth) {
-          return context;
-        }
-      } catch {
-        continue;
+  private hasAuthCookie(cookieText: string): boolean {
+    const names = this.getAuthCookieNames();
+    for (const name of names) {
+      if (cookieText.includes(`${name}=`)) {
+        return true;
       }
     }
-
-    return contexts[0];
+    return false;
   }
 
   private getAuthCookieNames(): Set<string> {
     return new Set(["web_session", "websectiga", "web_session_sid", "a1", "gid"]);
   }
 
-  private async detectRisk(page: Page): Promise<void> {
-    const text = (await page.content()).toLowerCase();
+  private async detectRisk(): Promise<void> {
+    const text = await this.driver.evaluate<string>(`return (document.body?.innerText || '').toLowerCase();`);
     for (const pattern of RISK_PATTERNS) {
       if (text.includes(pattern)) {
         throw new AppError("platform_blocked", `risk control detected: ${pattern}`);
@@ -571,7 +353,7 @@ export class XhsClient {
     }
 
     if (session.status === "pending") {
-      const loggedIn = await this.isLoggedIn(session.page);
+      const loggedIn = await this.isLoggedIn();
       if (loggedIn) {
         await this.markLoginSessionSuccess(session);
       } else if (Date.now() >= session.expiresAt) {
@@ -587,9 +369,6 @@ export class XhsClient {
     if (this.loginSession !== session) {
       return false;
     }
-    if (session.page.isClosed()) {
-      return false;
-    }
     return true;
   }
 
@@ -600,7 +379,7 @@ export class XhsClient {
       }
 
       try {
-        const loggedIn = await this.isLoggedIn(session.page);
+        const loggedIn = await this.withRuntime(async () => this.isLoggedIn());
         if (loggedIn) {
           await this.markLoginSessionSuccess(session);
           return;
@@ -620,8 +399,6 @@ export class XhsClient {
     if (session.status === "success") {
       return;
     }
-
-    await this.saveSessionState(session.context);
 
     session.status = "success";
     session.expiresAt = Date.now() + LOGIN_SUCCESS_KEEPALIVE_MS;
@@ -656,7 +433,6 @@ export class XhsClient {
     }
 
     this.loginSession = null;
-    await session.page.close().catch(() => undefined);
   }
 
   private async ensureQrcodeFileReadyOrRewrite(session: LoginSession): Promise<void> {
@@ -664,21 +440,26 @@ export class XhsClient {
       await this.ensureQrcodeFileReady();
       return;
     } catch {
-      const src = await session.page.getAttribute(".login-container .qrcode-img", "src");
-      if (!src) {
+      const src = await this.driver.evaluate<string | null>(`
+        const img = document.querySelector('.login-container .qrcode-img, .login-mask .qrcode-img');
+        return img?.getAttribute('src') ?? null;
+      `);
+      const usableSrc = src ?? session.qrCodeSrc;
+      if (!usableSrc) {
         throw new AppError("internal_error", "failed to refresh qrcode from active login session");
       }
-      session.qrCodeSrc = src;
-      await this.persistQrcode(src);
+      session.qrCodeSrc = usableSrc;
+      await this.persistQrcode(usableSrc);
       await this.ensureQrcodeFileReady();
     }
   }
 
-  private async readUsername(page: Page): Promise<string | undefined> {
-    return page.evaluate(() => {
-      const el = document.querySelector(".main-container .user .link-wrapper .channel");
-      return (el?.textContent ?? "").trim() || undefined;
-    });
+  private async readUsername(): Promise<string | undefined> {
+    const username = await this.driver.evaluate<string>(`
+      const el = document.querySelector('.main-container .user .link-wrapper .channel');
+      return (el?.textContent ?? '').trim();
+    `);
+    return username || undefined;
   }
 
   private async persistQrcode(src: string): Promise<void> {
@@ -759,14 +540,15 @@ export class XhsClient {
 
     const ihdrChunkType = buffer.subarray(12, 16).toString("ascii");
     if (ihdrChunkType !== "IHDR") {
-      throw new AppError("internal_error", "qrcode png ihdr chunk missing");
+      throw new AppError("internal_error", "qrcode png missing ihdr chunk");
     }
 
     const width = buffer.readUInt32BE(16);
     const height = buffer.readUInt32BE(20);
     if (width <= 0 || height <= 0) {
-      throw new AppError("internal_error", "qrcode png dimensions are invalid");
+      throw new AppError("internal_error", "qrcode png has invalid dimensions");
     }
+
     return { width, height };
   }
 }

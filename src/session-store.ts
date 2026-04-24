@@ -1,9 +1,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { BrowserContextOptions } from "playwright";
 import { decryptJson, encryptJson } from "./crypto.js";
 
-type StorageState = Exclude<BrowserContextOptions["storageState"], undefined>;
+type StorageState = {
+  cookies?: unknown[];
+  origins?: unknown[];
+};
 
 export class SessionStore {
   public constructor(
